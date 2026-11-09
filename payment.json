@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "updatedAt": "2026-11-09T13:01:34.647Z",
+  "wallets": [],
+  "plans": [
+    {
+      "id": "month",
+      "label": "Monthly",
+      "price": 20,
+      "months": 1,
+      "currency": "USDT",
+      "oxapayLink": "https://pay.oxapay.com/16372736"
+    },
+    {
+      "id": "plan2",
+      "label": "3 months",
+      "price": 40,
+      "months": 1,
+      "currency": "USDT",
+      "oxapayLink": "https://pay.oxapay.com/13511467"
+    }
+  ],
+  "contact": {
+    "telegram": "quiortt",
+    "bot": "trad_AIbot",
+    "email": "admin@gettradai.app"
+  },
+  "instructions": ""
+}
