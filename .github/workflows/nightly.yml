@@ -1,0 +1,160 @@
+# Nightly jobs of TradAI Multi-Asset, run here because GitHub Actions is free on public repos.
+# The code lives in the private repo quiort/tradAI-v1 and is checked out with the CODE_TOKEN
+# secret (a fine-grained token with read-only Contents on that repo). Results are committed to
+# this repo: leaderboard.json (free channels) and tradai-lab.json (TradAI's own signals).
+# Logs are public: the lab prints totals only (PUBLIC_LOG=1).
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: leaderboard
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 175
+    env:
+      RELEASE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: quiort/tradAI-v1
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no Electron download)
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: npm install --no-audit --no-fund --ignore-scripts
+
+      - name: Price cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/candles
+          key: candles-${{ github.run_id }}
+          restore-keys: candles-
+
+      # Signals as first seen, kept from night to night (deleted and edited posts are noticed).
+      - name: Signal archive
+        uses: actions/cache@v4
+        with:
+          path: .cache/posts
+          key: posts-${{ github.run_id }}
+          restore-keys: posts-
+
+      - name: Collect channel suggestions and last night's board
+        run: |
+          curl -sS "https://api.github.com/repos/${RELEASE_REPO}/issues?state=open&per_page=100" -o issues.json || echo '[]' > issues.json
+          node -e "
+            const fs = require('fs');
+            let issues = []; try { issues = JSON.parse(fs.readFileSync('issues.json', 'utf8')); } catch {}
+            const names = (Array.isArray(issues) ? issues : []).filter((i) => !i.pull_request && /channel suggestion/i.test(i.title || ''))
+              .map((i) => ((i.title || '').match(/@?([A-Za-z0-9_]{4,32})\s*$/) || [])[1]).filter(Boolean);
+            fs.writeFileSync('suggestions.json', JSON.stringify([...new Set(names)].slice(0, 30)));
+            console.log('Suggestions:', names.join(', ') || 'none');
+          "
+          curl -sSfL "https://raw.githubusercontent.com/${RELEASE_REPO}/main/leaderboard.json" -o previous.json || echo '{}' > previous.json
+
+      - name: Find, check and audit channels
+        run: |
+          set -o pipefail
+          node scripts/leaderboard-build.js --out leaderboard.json --previous previous.json --suggestions suggestions.json 2> build.log || { tail -n 80 build.log; exit 1; }
+          grep -E 'Starting|Web|Snowball|Checked|Unread|unread @|Unknown symbols|\[[0-9]+/[0-9]+\]|Wrote|budget|Grade|profitable @|worst trade' build.log || tail -n 120 build.log
+          node -e "
+            const b = JSON.parse(require('fs').readFileSync('leaderboard.json', 'utf8'));
+            console.log('Channels:', b.channels.length, 'stats:', JSON.stringify(b.stats));
+            if (!b.channels.length) { console.error('Empty result; keeping the previous leaderboard.'); process.exit(1); }
+          "
+
+      - name: Publish to the release repo
+        env:
+          RELEASES_TOKEN: ${{ github.token }}
+        run: |
+          # The lab job publishes to the same repo at the same time: try again on a rejected push.
+          for attempt in 1 2 3 4; do
+            rm -rf out
+            git clone --depth 1 "https://x-access-token:${RELEASES_TOKEN}@github.com/${RELEASE_REPO}.git" out
+            cp leaderboard.json out/leaderboard.json
+            cd out
+            git checkout -B main
+            git config user.name "TradAI leaderboard"
+            git config user.email "leaderboard@users.noreply.github.com"
+            git add leaderboard.json
+            git diff --cached --quiet && { echo "No change"; exit 0; }
+            git commit -q -m "Leaderboard $(date -u +%Y-%m-%d)"
+            if git push origin HEAD:main; then exit 0; fi
+            cd ..; sleep $((attempt * 7))
+          done
+          echo "Could not publish the leaderboard"; exit 1
+
+  # TradAI's own signals: the nightly walk-forward test of strategies on every liquid market
+  # (scripts/signals-lab.js). Publishes tradai-lab.json next to the leaderboard: the approved
+  # setups the app may post, every market's unseen record, and the forward track record.
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 175
+    env:
+      RELEASE_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: quiort/tradAI-v1
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install dependencies (no Electron download)
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: npm install --no-audit --no-fund --ignore-scripts
+
+      - name: Price cache
+        uses: actions/cache@v4
+        with:
+          path: .cache/candles
+          key: lab-candles-${{ github.run_id }}
+          restore-keys: lab-candles-
+
+      - name: Last night's lab file
+        run: curl -sSfL "https://raw.githubusercontent.com/${RELEASE_REPO}/main/tradai-lab.json" -o previous-lab.json || echo '{}' > previous-lab.json
+
+      - name: Test every market
+        run: |
+          set -o pipefail
+          PUBLIC_LOG=1 LAB_MINUTES=150 node scripts/signals-lab.js --out tradai-lab.json --previous previous-lab.json 2> lab.log || { tail -n 80 lab.log; exit 1; }
+          cat lab.log
+
+      - name: Publish to the release repo
+        env:
+          RELEASES_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4; do
+            rm -rf out
+            git clone --depth 1 "https://x-access-token:${RELEASES_TOKEN}@github.com/${RELEASE_REPO}.git" out
+            cp tradai-lab.json out/tradai-lab.json
+            cd out
+            git checkout -B main
+            git config user.name "TradAI lab"
+            git config user.email "lab@users.noreply.github.com"
+            git add tradai-lab.json
+            git diff --cached --quiet && { echo "No change"; exit 0; }
+            git commit -q -m "Lab $(date -u +%Y-%m-%d)"
+            if git push origin HEAD:main; then exit 0; fi
+            cd ..; sleep $((attempt * 7))
+          done
+          echo "Could not publish the lab file"; exit 1

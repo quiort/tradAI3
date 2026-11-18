@@ -1,0 +1,175 @@
+# Builds TradAI Multi-Asset and publishes the Windows installer here, in this public repo's
+# Releases, where installed copies of TradAI look for updates. Runs here because GitHub Actions
+# is free on public repos.
+#
+# Every 15 minutes it checks the private code repo (quiort/tradAI-v1, read with the CODE_TOKEN
+# secret). A new commit on its main branch is built, tested and released, unless the change only
+# touched notes (*.md, marketing). Each version is the last release's number + 1, so installed
+# apps always see it as newer. A commit that failed to build is not retried until the next one
+# (or a manual run with "force").
+name: Build & release
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if this commit was built or tried before
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CODE_REPO: quiort/tradAI-v1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.code.outputs.sha }}
+      next: ${{ steps.decide.outputs.next }}
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Latest commit of the code repo
+        id: code
+        env:
+          GH_TOKEN: ${{ secrets.CODE_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || { echo "The CODE_TOKEN secret is missing (Settings > Secrets and variables > Actions)."; exit 1; }
+          echo "sha=$(gh api "repos/$CODE_REPO/commits/main" --jq .sha)" >> "$GITHUB_OUTPUT"
+
+      - name: Tried before?
+        id: seen
+        uses: actions/cache/restore@v4
+        with:
+          path: .attempt
+          key: attempt-${{ steps.code.outputs.sha }}
+          lookup-only: true
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE_TOKEN: ${{ secrets.CODE_TOKEN }}
+          SHA: ${{ steps.code.outputs.sha }}
+          SEEN: ${{ steps.seen.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          next=$(node -e "
+            const r = JSON.parse(require('fs').readFileSync('releases.json', 'utf8'));
+            const n = r.map((x) => Number((x.tag_name.match(/^v\d+\.\d+\.(\d+)$/) || [])[1])).filter(Number.isFinite);
+            console.log(n.length ? Math.max(...n) + 1 : 1);")
+          last=$(node -e "
+            const r = JSON.parse(require('fs').readFileSync('releases.json', 'utf8')).filter((x) => !x.draft);
+            r.sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at));
+            console.log(((r[0] && r[0].body) || '').match(/Source: ([0-9a-f]{40})/)?.[1] || '');")
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          build=true
+          if [ "$FORCE" != "true" ]; then
+            if [ "$last" = "$SHA" ]; then build=false; echo "Already released $SHA";
+            elif [ "$SEEN" = "true" ]; then build=false; echo "Already tried $SHA (failed); push a fix or run with force";
+            elif [ -n "$last" ]; then
+              files=$(GH_TOKEN="$CODE_TOKEN" gh api "repos/$CODE_REPO/compare/$last...$SHA" --jq '.files[].filename' || echo "unknown")
+              if [ -n "$files" ] && ! echo "$files" | grep -qvE '(\.md$|^marketing/|^\.gitignore$|^SETUP-GITHUB-SYNC\.cmd$|^\.github/)'; then
+                build=false; echo "Only notes changed since the last release"
+              fi
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "Build: $build (next version number $next)"
+
+  release:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      SHA: ${{ needs.check.outputs.sha }}
+      BUILD_NUMBER: ${{ needs.check.outputs.next }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: quiort/tradAI-v1
+          ref: ${{ needs.check.outputs.sha }}
+          token: ${{ secrets.CODE_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      # major.minor come from package.json, the patch number is the last release's + 1.
+      - name: Set release version and update owner
+        run: |
+          set -o pipefail
+          node scripts/ci-set-version.js 2>&1 | tee -a build.log
+
+      - name: Install dependencies
+        run: |
+          set -o pipefail
+          npm install --no-audit --no-fund 2>&1 | tee -a build.log
+
+      - name: Syntax check and tests
+        run: |
+          set -o pipefail
+          npm run check 2>&1 | tee -a build.log
+
+      # Hidden draft first; made public (and "Latest") only once every file is uploaded, so
+      # installed apps never see a half-uploaded release.
+      - name: Create draft release
+        run: |
+          set -o pipefail
+          gh release create "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "TradAI Multi-Asset $VERSION" --notes "TradAI Multi-Asset $VERSION
+
+          Source: $SHA" 2>&1 | tee -a build.log
+
+      - name: Build installer and upload it
+        run: |
+          set -o pipefail
+          npx electron-builder --win nsis --publish always 2>&1 | tee -a build.log
+
+      - name: Check uploads and publish release
+        run: |
+          set -o pipefail
+          {
+            assets=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            echo "Uploaded files:"; echo "$assets"
+            for f in latest.yml "TradAI3-Setup-$VERSION.exe" "TradAI3-Setup-$VERSION.exe.blockmap"; do
+              echo "$assets" | grep -qxF "$f" || { echo "Missing $f in the release"; exit 1; }
+            done
+            gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION"
+          } 2>&1 | tee -a build.log
+
+      - name: Remove draft if the build failed
+        if: failure() && env.VERSION != ''
+        run: |
+          draft=$(gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null || echo "")
+          if [ "$draft" = "true" ]; then gh release delete "v$VERSION" --repo "$GITHUB_REPOSITORY" --yes; fi
+
+      - name: Show the end of the log
+        if: failure()
+        run: tail -n 120 build.log 2>/dev/null || true
+
+      - name: Remember this commit was tried
+        if: always()
+        run: mkdir -p .attempt && echo "$SHA" > .attempt/sha
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .attempt
+          key: attempt-${{ needs.check.outputs.sha }}
