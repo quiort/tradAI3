@@ -9,16 +9,22 @@ on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: leaderboard
-  cancel-in-progress: false
+    inputs:
+      only:
+        description: Run only one job (lab or scraper); empty runs both
+        type: choice
+        options: ['', lab, scraper]
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: inputs.only != 'lab'
+    concurrency:
+      group: nightly-scraper
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 175
     env:
@@ -103,6 +109,10 @@ jobs:
   # (scripts/signals-lab.js). Publishes tradai-lab.json next to the leaderboard: the approved
   # setups the app may post, every market's unseen record, and the forward track record.
   lab:
+    if: inputs.only != 'scraper'
+    concurrency:
+      group: nightly-lab
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 175
     env:
