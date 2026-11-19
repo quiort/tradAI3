@@ -1,0 +1,53 @@
+# Posts TradAI's own signals to the Telegram channel as they trigger (free Actions on public repos).
+# Twice an hour it checks every market a strategy is switched on for (from tradai-lab.json, built
+# nightly) with the same code as the app, and posts each new signal once. Needs the secrets
+# TELEGRAM_BOT_TOKEN (the bot, an admin of the channel) and TELEGRAM_CHAT (e.g. @tradai_signals);
+# until they exist it posts nothing. The daily journal is posted by the nightly job.
+name: Telegram signals
+
+on:
+  schedule:
+    - cron: '5 * * * *'
+    - cron: '25 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: telegram
+  cancel-in-progress: false
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: quiort/tradAI-v1
+          ref: main
+          token: ${{ secrets.CODE_TOKEN }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Install price libraries only
+        run: npm install --omit=dev --no-audit --no-fund --ignore-scripts
+
+      # What was already posted, and recent prices, carried from run to run.
+      - name: Channel state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/telegram
+            .cache/candles
+          key: telegram-${{ github.run_id }}
+          restore-keys: telegram-
+
+      - name: Tonight's lab file
+        run: curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/main/tradai-lab.json" -o tradai-lab.json
+
+      - name: Post new signals
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+        run: node scripts/telegram-channel.js --mode signals --lab tradai-lab.json --state .cache/telegram

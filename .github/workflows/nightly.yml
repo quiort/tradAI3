@@ -168,3 +168,12 @@ jobs:
             cd ..; sleep $((attempt * 7))
           done
           echo "Could not publish the lab file"; exit 1
+
+      # The day's closed trades, posted to the Telegram channel (scheduled runs only, so a manual
+      # rerun never posts the same journal twice). Nothing is posted until the secrets exist.
+      - name: Journal to Telegram
+        if: github.event_name == 'schedule'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+        run: node scripts/telegram-channel.js --mode recap --lab tradai-lab.json
