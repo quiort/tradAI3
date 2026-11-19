@@ -10,6 +10,12 @@ on:
     - cron: '5 * * * *'
     - cron: '25 * * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: signals (check for new signals) or intro (post the welcome message once)
+        type: choice
+        options: [signals, intro]
+        default: signals
 
 concurrency:
   group: telegram
@@ -50,4 +56,4 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
-        run: node scripts/telegram-channel.js --mode signals --lab tradai-lab.json --state .cache/telegram
+        run: node scripts/telegram-channel.js --mode "${{ inputs.mode || 'signals' }}" --lab tradai-lab.json --state .cache/telegram
